@@ -241,8 +241,8 @@ function Ichimoku(highs, lows, conv = 9, base = 26, spanB = 52, shift = 26) {
   const spanA = Array(len).fill(null);
   const spanBArr = Array(len).fill(null);
 
-  const HH = (arr, i, p) => Math.max(...arr.slice(i - p + 1, i + 1));
-  const LL = (arr, i, p) => Math.min(...arr.slice(i - p + 1, i + 1));
+  const hh = Math.max(...highs.slice(i - kPeriod + 1, i + 1));
+  const ll = Math.min(...lows.slice(i - kPeriod + 1, i + 1));
 
   for (let i = 0; i < len; i++) {
     if (i >= conv - 1) convLine[i] = (HH(highs, i, conv) + LL(lows, i, conv)) / 2;
@@ -285,7 +285,7 @@ app.post("/helpers/indicators", async (req, res) => {
     const atrLen = params.atr ?? 14;
     const adxLen = params.adx ?? 14;
     const stochCfg = { k: 14, d: 3, ...(params.stoch || {}) };
-    const ichiCfg = { conv: 9, base: 26, spanB: 52, shift: 26, ...(params.ichimoku || {}) };
+    const ichiCfg  = { conv: 9, base: 26, spanB: 52, shift: 26, ...(params.ichimoku || {}) };
 
     // 本数チェック（“最小60本”推奨、SMA200やIchimoku雲はさらに必要）
     if (candles.length < 60)
@@ -340,12 +340,85 @@ app.post("/helpers/indicators", async (req, res) => {
       }
     };
 
-    res.json({ meta: { instrument, granularity, candles: candles.length }, last, series: out });
+    res.json({
+      ema: last.ema,         // { "20": 値, "50": 値, ... }
+      rsi: last.rsi,         // number
+      macd: last.macd,       // { macd, signal, hist }
+      bb: last.bb,           // { middle, upper, lower, width }
+      atr: last.atr,         // number
+      adx: last.adx          // number
+    });
+
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Server error", detail: String(e) });
   }
 });
 
+// ==============================
+// B. 未実装エンドポイントの雛形
+// ==============================
+
+// プリセット判定
+app.post("/helpers/signal/preset", async (req, res) => {
+  const body = await getBody(req);
+  const match = !!(body?.indicators?.trigger?.adx && body.indicators.trigger.adx >= 18);
+  res.json({
+    match,
+    rationale: match ? ["ADX>=18でトレンド性あり"] : ["ADX<18で不一致"],
+    suggestedEntry: {
+      direction: "long",
+      entryZone: "BB middle±ATR",
+      invalidation: "BB lower割れ"
+    },
+    riskHint: {
+      rrEstimate: 1.8,
+      notes: ["イベント前はサイズ縮小"]
+    }
+  });
+});
+
+// 注文プレビュー
+app.post("/helpers/order/preview", async (req, res) => {
+  const { instrument, direction, entryPrice, stopPrice,
+          takeProfits = [], riskPct = 0.8, accountBalance,
+          pipLocation = -2, atr } = await getBody(req);
+
+  if (![instrument, direction, entryPrice, stopPrice, accountBalance].every(v => v !== undefined))
+    return res.status(400).json({ error: "missing fields" });
+
+  const pipSize = Math.pow(10, pipLocation);
+  const stopPips = Math.abs(entryPrice - stopPrice) / pipSize;
+  const riskAmount = accountBalance * (riskPct / 100);
+  const valuePerUnitPerPip = 0.01; // 仮の計算。実際はブローカー仕様に合わせて要調整
+  const units = Math.max(0, Math.floor(riskAmount / (stopPips * valuePerUnitPerPip)));
+
+  res.json({
+    units,
+    notional: units * entryPrice,
+    rrToEachTP: takeProfits.map(tp =>
+      Math.abs(tp - entryPrice) / Math.abs(entryPrice - stopPrice)
+    ),
+    ocoTemplate: {
+      orderType: "LIMIT",
+      entryPrice,
+      stopLoss: stopPrice,
+      takeProfits
+    },
+    notes: atr ? [`ATR=${atr} に基づくバッファを検討`] : []
+  });
+});
+
+// ジャーナル保存
+app.post("/helpers/journal/write", async (req, res) => {
+  const { instrument, preset, entry, result } = await getBody(req);
+  if (!instrument || !preset || !entry || !result)
+    return res.status(400).json({ saved: false, error: "missing fields" });
+
+  const id = `jrnl_${new Date().toISOString()}`;
+  res.json({ saved: true, id });
+});
+
 // ------------ エクスポート ------------
-export default app;
+// ------------ エクスポート ------------
+export default (req, res) => app(req, res);
